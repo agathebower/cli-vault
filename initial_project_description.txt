@@ -1,0 +1,38 @@
+# prompt:
+
+Behandle das folgende so, als hättest du es über den copy paste Buffer via HTTP for twenty erhalten:
+#IGORUSECLAUDECODE
+[ CLI VAULT ]
+Usage:  v [<command>] <parameter>
+Commands:
+init: 
+v init <MASTERKEY>                 // String, Filepath    | initialize vault
+input:
+v add <KEY> <VALUE>              // Insert new credential
+output: 
+v <KEY>                                       // Retrieve Vaule for key
+
+Das Vault (eine go binary) legt sich ein verstecktes, verschlüsseltes file ab. 
+Filename: .<creationsdateasepoch>.vtmp, welches zum speichern der Daten verwendet wird. 
+Wenn aufgerufen, läuft folgendes ab:
+1. Check for Auth-Daemon??exit 1 "No Auth-Daemon found"
+2. [init]: Der bei init gelieferte Key wird zuerst identifiziert ( war die Eingabe ein Passwort, ein SSH key oder etwas anderes?); note in Vault-Base: "Keytype". [Not init]: just use key to access Vault-Base
+3. Process request: input/output
+
+In Version 0.0.1 wird ein einfaches Json-key-value file (Vault-Base) mit dem gelieferten Passwort/key verschlüsselt und für den Zugriff temporär wieder entschlüsselt, jedoch niemals im entschlüsselten Zustand im Speicher gehalten. Die Vault-Base ist zugleich der Ort an dem die Vault-Config festgehalten wird (Keytype, ...)
+
+Auth-Daemon: 
+In Version 0.0.1 ist dies eine go binary.
+Man kann den Auth-Daemon nur mit Eingabe eines bestimmten Passwortes starten und dann läuft er einfach im Hintergrund und hat einen bestimmten Namen der sich aus mehreren Parametern zusammensetzt die aus dem aktuell laufenden System genommen werden. ( mehr Detail hierzu weiter unten)
+Dieser Prozess authentifiziert das vault.
+
+Name:
+<Current process ID>.<Current date in epoch>.<currentUserNameEncryptedWithMasterKey>
+Auf diese Weise kann das Vault die Authentizität und die Existenz des Auth-Daemons verifizieren und validieren.
+
+If anything is unclear, its crucial to fist clarify all details.
+
+
+Wichtig:
+* Wenn ich einen MasterKey exporte, ist das passwort zum vault nicht sehr sicher! Der Masterkey sollte  NUR verwendet um, mit dem vault zu interagieren (durch die 'vault'-binary). Der user muss "NUR" den auth-daemon starten (und das beim init verwendete passwort nutzen). Es sollte kein MASTER_KEY exportiert werden muessen. Zur authentifizierung prueft die vault-binary ob der auth-daemon laeuft. Dies wird anhand des Namens des auth-daemons geprueft. 
+

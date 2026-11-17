@@ -1,0 +1,425 @@
+⚡ Perfekt. Hier ist das finale Prompt für Claude Code:
+
+---
+
+```
+# Vault System v2 — Rewrite auf Agent-Modell (Unix Socket)
+
+## Aufgabe
+Rewrite des bestehenden vault-systems unter /home/igor/workspace/vault-system/ auf 
+ein sicheres Agent-Modell, analog zu ssh-agent. Der MasterKey / Private Key darf 
+den auth-daemon NIEMALS verlassen. Der User exportiert KEINEN MASTER_KEY.
+
+## Bestehende Codebase
+Pfad: /home/igor/workspace/vault-system/
+Struktur:
+  cmd/vault/main.go           — vault CLI binary
+  cmd/auth-daemon/main.go     — Daemon binary (wird zu vaultd)
+  pkg/crypto/crypto.go        — AES-256-GCM, DeriveKey, EncryptUsername
+  pkg/vault/vault.go          — Vault CRUD, FindVaultFile (~/.EPOCH.vtmp)
+  pkg/daemon/daemon.go        — Process discovery + StartAuthDaemon
+  pkg/keytype/keytype.go      — SSH-Key vs. Password detection
+
+Bekannte Bugs im aktuellen Code (alle beheben):
+  1. MasterKey wird als argv[1] übergeben → sichtbar in /proc/PID/cmdline + `ps aux`
+  2. renameProcess() ist No-Op (berechnet Namen, setzt ihn aber nie)
+  3. EncryptUsername verwendet zufälligen Nonce → Discovery unmöglich
+  4. vault add/get brauchen VAULT_MASTERKEY env-var (das soll entfallen)
+  5. vault.GetVaultPath() erzeugt bei jedem Aufruf neuen Epoch-Namen statt fixen
+
+## Ziel-Architektur
+
+```
+vault init --password
+  → Gibt aus: "Initialisiere Vault mit SYMMETRISCHER Verschlüsselung (AES-256-GCM, PBKDF2)..."
+  → liest Passwort interaktiv von TTY (zweimal, Bestätigung), NOT von argv/env
+  → leitet via PBKDF2-SHA256(100k iterations) einen AES-Key ab
+  → erstellt Vault-File (~/.vault — fixer Name, nicht Epoch-basiert)
+  → startet vaultd (Daemon)
+
+vault init --key /path/to/id_rsa
+  → Gibt aus: "Initialisiere Vault mit ASYMMETRISCHER Verschlüsselung (RSA-OAEP / ECDH-AES)..."
+  → liest Private Key (RSA, Ed25519, ECDSA P-256)
+  → Falls verschlüsselt: fragt Passphrase interaktiv von TTY
+  → extrahiert Public Key
+  → verschlüsselt einen zufälligen AES-Key mit dem Public Key
+  → erstellt Vault-File (~/.vault)
+  → startet vaultd (Daemon)
+
+vaultd (der Daemon)
+  → empfängt Credentials EINMALIG beim Start via os.Pipe (nicht argv, nicht env)
+  → benennt sich um via syscall.Prctl(PR_SET_NAME, "vaultd")
+  → öffnet Unix-Socket: $XDG_RUNTIME_DIR/vault.sock (Permissions: 0600)
+  → speichert eigene PID in $XDG_RUNTIME_DIR/vault.pid
+  → prüft bei jeder Verbindung die Peer-UID via SO_PEERCRED (nur eigener User)
+  → antwortet auf Requests: {"op":"get","key":"X"} → {"ok":true,"value":"Y"}
+  → Encryption-Key verlässt den Daemon NIE
+  → bei SIGTERM/SIGINT: Socket + Lockfile aufräumen, dann exit
+
+vault add KEY VALUE
+  → findet Socket via $XDG_RUNTIME_DIR/vault.sock
+  → sendet: {"op":"add","key":"K","value":"V"}
+  → kein Passwort, kein env-var nötig
+
+vault get KEY
+  → findet Socket via $XDG_RUNTIME_DIR/vault.sock
+  → sendet: {"op":"get","key":"K"}
+  → empfängt: {"ok":true,"value":"V"} oder {"ok":false,"error":"..."}
+
+vault stop
+  → sendet SIGTERM an vaultd (PID aus $XDG_RUNTIME_DIR/vault.pid)
+
+vault status
+  → prüft ob Socket existiert → "running (PID: X, uptime: Y)" oder "not running"
+
+vault daemon start [--key /path/to/id_rsa | --password]
+  → Manueller Restart nach Reboot
+  → liest Credentials interaktiv
+  → startet vaultd
+  → (vault-File Header enthält keytype, damit wird die Decrypt-Methode bestimmt)
+```
+
+## Anforderungen im Detail
+
+### 1. Credential-Input (SICHERHEITSKRITISCH: Kein argv-Leak)
+
+Beim init:
+```go
+// Starte auth-daemon via Pipe, nicht argv
+r, w, _ := os.Pipe()
+cmd := exec.Command(daemonPath)
+cmd.ExtraFiles = []*os.File{r}   // wird fd 3
+cmd.Start()
+
+// Schreibe Secret zu Pipe (base64-encoded, zeilenweise)
+secretBytes := []byte(encryptionKeyHex + "\n")  // oder Pfad zum decrypted Key
+w.Write(secretBytes)
+w.Close()
+r.Close()
+```
+
+In vaultd:
+```go
+secretBytes, _ := io.ReadAll(os.NewFile(3, "pipe"))
+// Secret sofort in RAM halten
+// fd 3 ist jetzt invalid
+```
+
+### 2. vault init --password
+
+- Öffne /dev/tty für interaktive Eingabe
+- Frage Passwort zweimal (Bestätigung)
+- Gibt aus: "Initialisiere Vault mit SYMMETRISCHER Verschlüsselung (AES-256-GCM, PBKDF2).
+
+.."
+- Leite ab: salt = rand(16), key = PBKDF2-SHA256(password, salt, 100000 iterations, 32 bytes)
+- Vault-Header:
+  ```json
+  {
+    "keytype": "password",
+    "salt": "hex...",
+    "pbkdf2_iterations": 100000,
+    "created_at": 1234567890
+  }
+  ```
+- Vault-Payload: AES-256-GCM(json.marshal({"credentials":{}}), key)
+- Schreibe ~/.vault (Permissions 0600)
+- Starte vaultd via Pipe mit hex(key)
+
+### 3. vault init --key /path/to/id_rsa
+
+- Lese Private Key (PEM)
+- Falls verschlüsselt: Frage Passphrase interaktiv von /dev/tty
+- Extrahiere Public Key
+- Gibt aus: "Initialisiere Vault mit ASYMMETRISCHER Verschlüsselung (RSA-OAEP / ECDH-AES)..."
+
+**Für RSA (RSA-OAEP):**
+  - Generiere random 32-byte AES-Key
+  - Verschlüssele mit RSA-OAEP (SHA-256, LABEL="")
+  - Vault-Header:
+    ```json
+    {
+      "keytype": "ssh-rsa",
+      "public_key": "-----BEGIN PUBLIC KEY-----\n...",
+      "wrapped_key": "base64(encrypted_aes_key)",
+      "created_at": 1234567890
+    }
+    ```
+  - Starte vaultd via Pipe mit hex(AES-Key)
+
+**Für Ed25519 (ECDH+KDF):**
+  - Konvertiere Ed25519 → X25519 (golang.org/x/crypto/ed25519)
+  - Generiere ephemeres X25519 Key-Pair
+  - ECDH → shared_secret (32 Bytes)
+  - KDF: SHA256(shared_secret + "vault-ed25519")[:32] = AES-Key
+  - Vault-Header:
+    ```json
+    {
+      "keytype": "ssh-ed25519",
+      "public_key": "ssh-ed25519 ...",
+      "ecdh_ephemeral_pub": "base64(ephemeral_public_x25519)",
+      "created_at": 1234567890
+    }
+    ```
+  - Starte vaultd via Pipe mit hex(AES-Key)
+
+**Für ECDSA P-256:** Analog zu Ed25519 (ECDH mit P-256)
+
+### 4. vaultd (Daemon)
+
+**Start:**
+- Lese Secret vom Pipe-fd 3 (sofort, bevor andere Sachen passieren)
+- Umbenennen via `syscall.Prctl(syscall.PR_SET_NAME, "vaultd")`
+- Lockfile schreiben: $XDG_RUNTIME_DIR/vault.pid mit eigener PID (0600)
+- Socket öffnen: $XDG_RUNTIME_DIR/vault.sock (listener, 0600)
+
+**Pro Connection (in Goroutine):**
+```go
+conn, _ := listener.Accept()
+defer conn.Close()
+
+// Prüfe SO_PEERCRED
+rawConn, _ := conn.(*net.UnixConn).SyscallConn()
+rawConn.Control(func(fd uintptr) {
+  var cred = unix.Ucred{}
+  unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED, &cred)
+  if cred.Uid != uint32(os.Getuid()) {
+    conn.Write([]byte(`{"ok":false,"error":"permission denied"}`))
+    return
+  }
+})
+
+// Dekodiere JSON-Request
+var req map[string]string
+json.NewDecoder(conn).Decode(&req)
+
+// Handle ops: "get", "add", "ping"
+switch req["op"] {
+case "get":
+  // Dekryptiere Vault-File, hole Wert, antworte
+  value := vault[req["key"]]
+  json.NewEncoder(conn).Encode(map[string]interface{}{"ok":true,"value":value})
+case "add":
+  // Dekryptiere Vault, update map, verschlüssele & schreibe zurück
+  vault[req["key"]] = req["value"]
+  reencryptAndWrite()
+  json.NewEncoder(conn).Encode(map[string]interface{}{"ok":true})
+case "ping":
+  json.NewEncoder(conn).Encode(map[string]interface{}{"ok":true})
+}
+```
+
+**Shutdown:**
+- SIGTERM/SIGINT → Socket schließen, Lockfile löschen, dann exit
+
+### 5. vault add / vault get / vault stop
+
+Keine Passwort-Eingabe. Nur Socket-Verbindung.
+
+### 6. vault daemon start [--key PATH | --password]
+
+Liest den Vault-Header aus ~/.vault (keytype), dann:
+- Wenn password: fragt Passwort + Salt aus Header → PBKDF2
+- Wenn ssh-*: fragt Passphrase, liest Private Key, dekryptiert wrapped_key oder ecdh
+- Startet vaultd
+
+### 7. Vault-File Format
+
+Pfad: ~/.vault (nicht Epoch-basiert!)
+```
+[Magic: "VAUT" (4 bytes)]
+[Version: 1 (1 byte)]
+[Header-Länge: uint16 big-endian (2 bytes)]
+[Header-JSON (variable)]
+[\n]
+[AES-256-GCM Ciphertext (Nonce prepended, variable)]
+```
+
+HeaderJSON Struktur:
+```json
+{
+  "keytype": "password|ssh-rsa|ssh-ed25519|ssh-ecdsa-p256",
+  "salt": "hex...",                    // nur password
+  "pbkdf2_iterations": 100000,         // nur password
+  "public_key": "-----BEGIN...",       // nur ssh-*
+  "wrapped_key": "base64...",          // nur ssh-rsa
+  "ecdh_ephemeral_pub": "base64...",   // ssh-ed25519/ecdsa
+  "created_at": 1234567890
+}
+```
+
+EncryptedPayload (Plaintext vor Verschlüsselung):
+```json
+{
+  "credentials": {
+    "key1": "value1",
+    "key2": "value2"
+}
+}
+```
+
+### 8. Sicherheits-Anforderungen (nicht verhandelbar)
+
+- MasterKey / Private Key erscheint NIEMALS in: argv, env, Logs, Vault-File
+- Vault-File, Socket, Lockfile: Permissions 0600
+- SO_PEERCRED-Check bei jeder Socket-Verbindung (UID-Vergleich)
+- Keine Speicherung des unverschlüsselten Keys auf Disk
+- Nach Pipe-Lesen: fd sofort schließen
+- Passwort-Eingabe IMMER von /dev/tty, nicht stdin/argv
+
+### 9. Build
+
+- Go, stdlib only (Ausnahme: golang.org/x/crypto für Ed25519-Konversion)
+- CGO_ENABLED=0
+- ldflags: -s -w
+- Binary-Namen: "vault" und "vaultd"
+- Ziel: linux/arm64
+
+Makefile:
+```makefile
+build:
+  CGO_ENABLED=0 go build -ldflags="-s -w" -o vault ./cmd/vault
+  CGO_ENABLED=0 go build -ldflags="-s -w" -o vaultd ./cmd/auth-daemon
+
+test:
+  go test -v ./tests/...
+
+clean:
+  rm -f vault vaultd
+  rm -rf tests/testdata
+```
+
+## Test-Anforderungen (MUSS nach Rewrite laufen — keine Shortcuts!)
+
+Schreibe einen Comprehensive-Test unter tests/security_test.go oder als 
+tests/security_test.sh. Alle Tests müssen PASS/FAIL mit klarem Beweis liefern.
+
+### Test 1: Kein Secret-Leak in /proc (KRITISCHSTER TEST)
+```
+Szenario:
+  1. vault init --password (Testpasswort: "test123")
+  2. Finde PID des vaultd (via pgrep vaultd)
+  3. Dumpe /proc/PID/cmdline → prüfe auf "test123" (muss NICHT enthalten sein)
+  4. Dumpe /proc/PID/environ → prüfe auf alle VAULT_*-Variablen (KEINE erlaubt)
+  5. Dumpe ps aux | grep vaultd → prüfe auf "test123" (muss NICHT enthalten sein)
+  6. Dumpe /proc/PID/cwd → soll ~/.vault nicht direkt zeigen (nur der Socket)
+  
+Erwartet: PASS
+Beweis: Screenshot von ps aux, /proc/PID/cmdline, Grep-Output
+```
+
+### Test 2: SO_PEERCRED-Schutz
+```
+Szenario (falls zwei User im System):
+  1. vault init --password als User A
+  2. vaultd läuft als User A
+  3. Versuche vault get KEY als User B (via sudo su - B vault get KEY)
+  4. Erwartet: Fehler "permission denied"
+  
+Alternative (Single-User-System):
+  1. Code-Review: Prüfe ob SO_PEERCRED-Check in vaultd/main.go vorhanden ist
+  2. Prüfe ob UID-Vergleich >= 95% Coverage hat
+  
+Ergebnis: PASS (praktisch oder Code-Review)
+```
+
+### Test 3: Funktionaler Roundtrip (Symmetrisch)
+```
+Szenario:
+  1. vault init --password → "SYMMETRISCHER..." muss im Output sein
+  2. vault add github_token "ghp_testtoken_12345"
+  3. vault get github_token → Output muss exakt "ghp_testtoken_12345" sein
+  4. vault stop
+  5. vault daemon start --password (selbes Passwort)
+  6. vault get github_token → Output muss immer noch "ghp_testtoken_12345" sein
+  7. vault get nonexistent_key → muss Fehler "not found" geben
+  
+Erwartet: PASS (7/7 Schritte erfolgreich)
+```
+
+### Test 4: Funktionaler Roundtrip (Asymmetrisch)
+```
+Szenario:
+  1. ssh-keygen -t rsa -b 2048 -f /tmp/test_vault_rsa -N "" (kein Passwort)
+  2. vault init --key /tmp/test_vault_rsa → "ASYMMETRISCHER..." muss im Output sein
+  3. vault add test_cred "secret_asymmetric"
+  4. vault get test_cred → Output muss "secret_asymmetric" sein
+  5. vault stop
+  6. vault daemon start --key /tmp/test_vault_rsa
+  7. vault get test_cred → muss immer noch "secret_asymmetric" sein
+  8. prüfe ~/.vault Header: keytype muss "ssh-rsa" sein
+  
+Erwartet: PASS (8/8)
+```
+
+### Test 5: Falsches Passwort → Fehler
+```
+Szenario:
+  1. vault init --password (Passwort: "correct")
+  2. vault stop
+  3. vault daemon start --password (Passwort: "wrong")
+  4. Erwartet: Error "failed to decrypt vault" oder ähnlich (NICHT silent fail)
+  5. vault status → "not running" (Daemon muss abgebrochen haben)
+  
+Ergebnis: PASS
+```
+
+### Test 6: Process Discovery
+```
+Szenario:
+  1. vault init --password
+  2. pgrep vaultd → muss PID zurückgeben (oder pidof vaultd)
+  3. vault status → Output muss "running (PID: X, uptime: ...)" sein
+  4. vault stop
+  5. vault status → Output muss "not running" sein
+  6. pgrep vaultd → muss KEINE PID zurückgeben (leerer Output)
+  
+Erwartet: PASS (6/6)
+```
+
+### Test 7: Falsche Passphrase für SSH-Key
+```
+Szenario:
+  1. ssh-keygen -t rsa -b 2048 -f /tmp/test_vault_enc -N "mypassphrase"
+  2. vault init --key /tmp/test_vault_enc (gebe falsches Passwort ein)
+  3. Erwartet: Error "failed to decrypt private key" (NICHT silent fail)
+  
+Ergebnis: PASS
+```
+
+### Test 8: Multiple Add/Get Operations
+```
+Szenario:
+  1. vault init --password
+  2. vault add db_pass "dbpass123"
+     vault add api_key "key_xyz"
+     vault add ssh_key "-----BEGIN PRIVATE KEY..."
+  3. vault get db_pass → "dbpass123"
+     vault get api_key → "key_xyz"
+     vault get ssh_key → "-----BEGIN PRIVATE KEY..."
+  4. vault add db_pass "updated_password" (update)
+  5. vault get db_pass → "updated_password"
+  6. vault stop
+  7. vault daemon start --password
+  8. Alle Werte müssen noch da sein und korrekt sein
+  
+Erwartet: PASS (Alle 8 Schritte)
+```
+
+## Was NICHT geändert wird
+- Der JSON-Aufbau des Vault-Inhalts ({"credentials": {...}})
+- Die AES-256-GCM Verschlüsselung für das Backend
+
+## Abnahme-Kriterien
+- ✅ Alle 8 Tests laufen grün durch
+- ✅ `ps aux | grep vaultd` zeigt NIEMALS ein Secret
+- ✅ `cat /proc/VAULTD_PID/cmdline` zeigt NIEMALS ein Secret
+- ✅ `vault init --password` gibt "SYMMETRISCHER" aus
+- ✅ `vault init --key` gibt "ASYMMETRISCHER" aus
+- ✅ `vault daemon start --key /path` funktioniert (Pfad als Argument erforderlich)
+- ✅ Keine VAULT_MASTERKEY env-var nötig für add/get
+- ✅ Binary-Size minimal (ldflags -s -w)
+```
+
+---
+
